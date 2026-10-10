@@ -38,7 +38,7 @@ export const AuthSettingsCard: React.FC = () => {
         return '系统已保留之前设置的管理员密码。输入当前密码即可快速重新启用认证。';
       case 'enabled':
         return !desiredEnabled 
-          ? '若当前登录会话仍有效，可直接关闭认证；若会话已失效，请输入当前管理员密码。'
+          ? '关闭认证会取消 Web 和 API 的访问保护，请输入当前管理员密码确认。'
           : '管理员认证已启用。如需更新密码，请使用下方的“修改密码”功能。';
       default:
         return '管理员认证可保护 Web 设置页及 API 接口，防止未经授权的访问。';
@@ -70,6 +70,11 @@ export const AuthSettingsCard: React.FC = () => {
         setError('两次输入的新密码不一致');
         return;
       }
+    }
+
+    if (authEnabled && !desiredEnabled && !currentPassword.trim()) {
+      setError('关闭认证前请输入当前管理员密码');
+      return;
     }
 
     setIsSubmitting(true);
@@ -138,7 +143,7 @@ export const AuthSettingsCard: React.FC = () => {
                   autoComplete="current-password"
                   disabled={isSubmitting}
                   placeholder="请输入当前密码"
-                  hint={setupState === 'password_retained' ? '输入旧密码以重新激活认证' : '关闭认证前可能需要验证身份'}
+                  hint={setupState === 'password_retained' ? '输入旧密码以重新激活认证' : '当前密码用于确认关闭访问保护'}
                 />
               </div>
             ) : null}

@@ -34,6 +34,7 @@ from tenacity import (
 from .base import BaseFetcher, DataFetchError, STANDARD_COLUMNS, is_bse_code
 from .realtime_types import UnifiedRealtimeQuote, RealtimeSource
 from .us_index_mapping import get_us_index_yf_symbol, is_us_stock_code
+from .yfinance_fundamental_adapter import _safe_float
 
 # 可选导入本地股票映射补丁，若缺失则使用空字典兜底
 try:
@@ -745,10 +746,16 @@ class YfinanceFetcher(BaseFetcher):
 
             # 获取股票名称
             try:
-                info_name = ticker.info.get('shortName', '') or ticker.info.get('longName', '') or ''
+                ticker_info = ticker.info or {}
+                info_name = ticker_info.get('shortName', '') or ticker_info.get('longName', '') or ''
                 name = info_name if is_meaningful_stock_name(info_name, symbol) else STOCK_NAME_MAP.get(symbol, '')
             except Exception:
+                ticker_info = {}
                 name = STOCK_NAME_MAP.get(symbol, '')
+
+            # Reuse the stock-name response rather than requesting info again.
+            pe_ratio = _safe_float(ticker_info.get('trailingPE'))
+            pb_ratio = _safe_float(ticker_info.get('priceToBook'))
 
             quote = UnifiedRealtimeQuote(
                 code=symbol,
@@ -766,8 +773,8 @@ class YfinanceFetcher(BaseFetcher):
                 high=high,
                 low=low,
                 pre_close=prev_close,
-                pe_ratio=None,
-                pb_ratio=None,
+                pe_ratio=pe_ratio,
+                pb_ratio=pb_ratio,
                 total_mv=market_cap,
                 circ_mv=None,
             )

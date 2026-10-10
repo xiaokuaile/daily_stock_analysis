@@ -17,7 +17,7 @@ ensure_litellm_stub()
 
 from src.config import ANSPIRE_LLM_MODEL_DEFAULT, Config
 from src.core.config_manager import ConfigManager
-from src.services.system_config_service import ConfigConflictError, ConfigImportError, SystemConfigService
+from src.services.system_config_service import ConfigConflictError, ConfigImportError, ConfigValidationError, SystemConfigService
 
 
 class SystemConfigServiceTestCase(unittest.TestCase):
@@ -57,6 +57,252 @@ class SystemConfigServiceTestCase(unittest.TestCase):
     def _mock_completion_response(content: str = "OK", tool_calls=None):
         message = SimpleNamespace(content=content, tool_calls=tool_calls or [])
         return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+    def test_generic_config_rejects_auth_changes_before_any_write(self) -> None:
+        for saved, submitted in [("true", "false"), ("false", "true"), (None, "true")]:
+            with self.subTest(saved=saved, submitted=submitted):
+                lines = ["STOCK_LIST=AAPL", "GEMINI_API_KEY=dummy-offline-key"]
+                if saved is not None:
+                    lines.append(f"ADMIN_AUTH_ENABLED={saved}")
+                self._rewrite_env(*lines)
+                before = self.env_path.read_bytes()
+                with self.assertRaises(ConfigValidationError) as ctx:
+                    self.service.update(
+                        config_version=self.manager.get_config_version(),
+                        items=[
+                            {"key": "STOCK_LIST", "value": "QQQ"},
+                            {"key": " admin_auth_enabled ", "value": submitted},
+                        ],
+                        reload_now=False,
+                    )
+                self.assertEqual(ctx.exception.issues[0]["code"], "auth_settings_required")
+                self.assertEqual(self.env_path.read_bytes(), before)
+
+    def test_generic_config_preserves_equivalent_auth_values_and_missing_default(self) -> None:
+        for saved, submitted in [
+            ("true", "TRUE"), ("1", "yes"), ("YES", "1"),
+            ("false", "NO"), ("0", "false"), (None, "false"), (None, ""),
+        ]:
+            with self.subTest(saved=saved, submitted=submitted):
+                lines = ["STOCK_LIST=AAPL", "GEMINI_API_KEY=dummy-offline-key"]
+                if saved is not None:
+                    lines.append(f"ADMIN_AUTH_ENABLED={saved}")
+                self._rewrite_env(*lines)
+                response = self.service.update(
+                    config_version=self.manager.get_config_version(),
+                    items=[
+                        {"key": "ADMIN_AUTH_ENABLED", "value": submitted},
+                        {"key": "STOCK_LIST", "value": "QQQ"},
+                    ],
+                    reload_now=False,
+                )
+                self.assertNotIn("ADMIN_AUTH_ENABLED", response["updated_keys"])
+                self.assertEqual(self.manager.read_config_map().get("ADMIN_AUTH_ENABLED"), saved)
+                self.assertEqual(self.manager.read_config_map()["STOCK_LIST"], "QQQ")
+
+    def test_env_import_rejects_auth_change_atomically_and_accepts_same_state(self) -> None:
+        self._rewrite_env("STOCK_LIST=AAPL", "GEMINI_API_KEY=dummy-offline-key", "ADMIN_AUTH_ENABLED=true")
+        before = self.env_path.read_bytes()
+        with self.assertRaises(ConfigValidationError):
+            self.service.import_env(
+                config_version=self.manager.get_config_version(),
+                content="STOCK_LIST=QQQ\nexport ADMIN_AUTH_ENABLED=false\n",
+                reload_now=False,
+            )
+        self.assertEqual(self.env_path.read_bytes(), before)
+        response = self.service.import_env(
+            config_version=self.manager.get_config_version(),
+            content="STOCK_LIST=QQQ\nADMIN_AUTH_ENABLED=YES\n",
+            reload_now=False,
+        )
+        self.assertTrue(response["success"])
+        self.assertEqual(self.manager.read_config_map()["ADMIN_AUTH_ENABLED"], "true")
+        self.assertEqual(self.manager.read_config_map()["STOCK_LIST"], "QQQ")
+
+    def test_generic_config_rejects_dotenv_key_and_value_injection(self) -> None:
+        self._rewrite_env("STOCK_LIST=AAPL", "GEMINI_API_KEY=dummy-offline-key", "ADMIN_AUTH_ENABLED=true")
+        before = self.env_path.read_bytes()
+        for key, value in [
+            ("export ADMIN_AUTH_ENABLED", "false"),
+            ("OTHER_KEY=x\nADMIN_AUTH_ENABLED", "false"),
+            ("'ADMIN_AUTH_ENABLED'", "false"),
+            ("CUSTOM_KEY", "x\rADMIN_AUTH_ENABLED=false"),
+            ("CUSTOM_KEY", "x\nADMIN_AUTH_ENABLED=false"),
+        ]:
+            with self.subTest(key=key):
+                with self.assertRaises(ConfigValidationError):
+                    self.service.update(
+                        config_version=self.manager.get_config_version(),
+                        items=[{"key": key, "value": value}],
+                        reload_now=False,
+                    )
+                self.assertEqual(self.env_path.read_bytes(), before)
+
+    def test_generic_auth_guard_preserves_json_templates_and_internal_auth_updates(self) -> None:
+        self._rewrite_env("STOCK_LIST=AAPL", "GEMINI_API_KEY=dummy-offline-key", "ADMIN_AUTH_ENABLED=true")
+        self.service.update(
+            config_version=self.manager.get_config_version(),
+            items=[
+                {"key": "CUSTOM_WEBHOOK_URLS", "value": "https://example.com/webhook"},
+                {"key": "CUSTOM_WEBHOOK_BODY_TEMPLATE", "value": '{"content":"$content_json"}'},
+                {"key": "AGENT_EVENT_ALERT_RULES_JSON", "value": '[\r\n{"stock_code":"AAPL","alert_type":"price_cross","direction":"above","price":100}\r\n]'},
+            ],
+            reload_now=False,
+        )
+        self.assertEqual(self.manager.read_config_map()["ADMIN_AUTH_ENABLED"], "true")
+        self.assertEqual(self.manager.read_config_map()["CUSTOM_WEBHOOK_BODY_TEMPLATE"], '{"content":"$content_json"}')
+        self.service.apply_simple_updates([("ADMIN_AUTH_ENABLED", "false")])
+        self.assertEqual(self.manager.read_config_map()["ADMIN_AUTH_ENABLED"], "false")
+
+    def test_generic_config_source_guard_uses_runtime_path_and_preserves_backup(self) -> None:
+        changed_path = self.env_path.parent / "different.env"
+        self._rewrite_env("STOCK_LIST=AAPL", "GEMINI_API_KEY=dummy-offline-key", "ADMIN_AUTH_ENABLED=true")
+        before = self.env_path.read_bytes()
+        with self.assertRaises(ConfigValidationError) as ctx:
+            self.service.update(
+                config_version=self.manager.get_config_version(),
+                items=[{"key": "ENV_FILE", "value": str(changed_path)}],
+                reload_now=False,
+            )
+        self.assertEqual(ctx.exception.issues[0]["code"], "config_source_change_required")
+        self.assertEqual(self.env_path.read_bytes(), before)
+        self.service.import_env(
+            config_version=self.manager.get_config_version(),
+            content=f"ENV_FILE={self.env_path}\nSTOCK_LIST=QQQ\n",
+            reload_now=False,
+        )
+        self.assertNotIn("ENV_FILE", self.manager.read_config_map())
+        self.assertEqual(self.manager.read_config_map()["STOCK_LIST"], "QQQ")
+        with patch.dict(os.environ, clear=False):
+            os.environ.pop("ENV_FILE", None)
+            self.service.update(
+                config_version=self.manager.get_config_version(),
+                items=[{"key": "ENV_FILE", "value": str(self.manager.env_path)}],
+                reload_now=False,
+            )
+        # A saved ENV_FILE value must not override the active runtime source.
+        self._rewrite_env("STOCK_LIST=AAPL", f"ENV_FILE={changed_path}")
+        with self.assertRaises(ConfigValidationError):
+            self.service.update(
+                config_version=self.manager.get_config_version(),
+                items=[{"key": "ENV_FILE", "value": str(changed_path)}],
+                reload_now=False,
+            )
+
+    def test_generic_config_prevents_enabled_auth_credential_directory_changes(self) -> None:
+        current_db = self.env_path.parent / "credentials" / "current.db"
+        changed_db = self.env_path.parent / "new-credentials" / "current.db"
+        same_parent_db = current_db.parent / "renamed.db"
+        self._rewrite_env("STOCK_LIST=AAPL", "GEMINI_API_KEY=dummy-offline-key", "ADMIN_AUTH_ENABLED=true")
+        with patch.dict(os.environ, {"DATABASE_PATH": str(current_db)}, clear=False):
+            before = self.env_path.read_bytes()
+            with self.assertRaises(ConfigValidationError) as ctx:
+                self.service.import_env(
+                    config_version=self.manager.get_config_version(),
+                    content=f"DATABASE_PATH={changed_db}\nSTOCK_LIST=QQQ\n",
+                    reload_now=False,
+                )
+            self.assertEqual(ctx.exception.issues[0]["code"], "auth_storage_change_required")
+            self.assertEqual(self.env_path.read_bytes(), before)
+            response = self.service.update(
+                config_version=self.manager.get_config_version(),
+                items=[{"key": "DATABASE_PATH", "value": str(same_parent_db)}],
+                reload_now=False,
+            )
+            self.assertTrue(response["success"])
+            self.assertEqual(self.manager.read_config_map()["DATABASE_PATH"], str(same_parent_db))
+        # Database migration remains available when admin auth is disabled.
+        self._rewrite_env("STOCK_LIST=AAPL", "GEMINI_API_KEY=dummy-offline-key", "ADMIN_AUTH_ENABLED=false")
+        response = self.service.update(
+            config_version=self.manager.get_config_version(),
+            items=[{"key": "DATABASE_PATH", "value": str(changed_db)}],
+            reload_now=False,
+        )
+        self.assertTrue(response["success"])
+
+    def test_generic_config_rejects_all_splitlines_separators_before_second_update(self) -> None:
+        for separator in "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029":
+            with self.subTest(separator=repr(separator)):
+                self._rewrite_env("STOCK_LIST=AAPL", "GEMINI_API_KEY=dummy-offline-key", "ADMIN_AUTH_ENABLED=true")
+                before = self.env_path.read_bytes()
+                with self.assertRaises(ConfigValidationError):
+                    self.service.update(
+                        config_version=self.manager.get_config_version(),
+                        items=[{"key": "CUSTOM_KEY", "value": f"ok{separator}ADMIN_AUTH_ENABLED=false"}],
+                        reload_now=False,
+                    )
+                self.assertEqual(self.env_path.read_bytes(), before)
+                # Exercise the real manager parse/serialize cycle a second time.
+                self.service.update(
+                    config_version=self.manager.get_config_version(),
+                    items=[{"key": "STOCK_LIST", "value": "QQQ"}],
+                    reload_now=False,
+                )
+                self.assertEqual(self.manager.read_config_map()["ADMIN_AUTH_ENABLED"], "true")
+
+    def test_json_unicode_separators_cannot_inject_auth_on_next_update(self) -> None:
+        for separator in ("\x85", "\u2028", "\u2029"):
+            with self.subTest(separator=repr(separator)):
+                self._rewrite_env("STOCK_LIST=AAPL", "GEMINI_API_KEY=dummy-offline-key", "ADMIN_AUTH_ENABLED=true")
+                body = ('[{"stock_code":"AAPL","alert_type":"price_cross","direction":"above",'
+                        '"price":100,"comment":"ok' + separator + 'ADMIN_AUTH_ENABLED=false"}]')
+                self.service.update(
+                    config_version=self.manager.get_config_version(),
+                    items=[{"key": "AGENT_EVENT_ALERT_RULES_JSON", "value": body}],
+                    reload_now=False,
+                )
+                self.service.update(
+                    config_version=self.manager.get_config_version(),
+                    items=[{"key": "STOCK_LIST", "value": "QQQ"}],
+                    reload_now=False,
+                )
+                self.assertEqual(self.manager.read_config_map()["ADMIN_AUTH_ENABLED"], "true")
+                import json
+                self.assertEqual(json.loads(self.manager.read_config_map()["AGENT_EVENT_ALERT_RULES_JSON"]), json.loads(body))
+
+    def test_generic_auth_guard_protects_direct_and_recursive_dotenv_dependencies(self) -> None:
+        for auth_lines, key in [
+            (["AUTH_SWITCH=true", "ADMIN_AUTH_ENABLED=${AUTH_SWITCH}"], "AUTH_SWITCH"),
+            (["AUTH_LEAF=true", "AUTH_SWITCH=${AUTH_LEAF}", "ADMIN_AUTH_ENABLED=${AUTH_SWITCH}"], "AUTH_LEAF"),
+        ]:
+            with self.subTest(key=key):
+                self._rewrite_env("STOCK_LIST=AAPL", "GEMINI_API_KEY=dummy-offline-key", *auth_lines)
+                before = self.env_path.read_bytes()
+                with self.assertRaises(ConfigValidationError) as ctx:
+                    self.service.update(
+                        config_version=self.manager.get_config_version(),
+                        items=[{"key": key, "value": "false"}],
+                        reload_now=False,
+                    )
+                self.assertEqual(ctx.exception.issues[0]["code"], "auth_dependency_change_required")
+                self.assertEqual(self.env_path.read_bytes(), before)
+                self.service.import_env(
+                    config_version=self.manager.get_config_version(),
+                    content="\n".join(["STOCK_LIST=QQQ", *auth_lines]) + "\n",
+                    reload_now=False,
+                )
+                self.assertEqual(self.manager.read_config_map()["ADMIN_AUTH_ENABLED"], "true")
+                self.assertIn("ADMIN_AUTH_ENABLED=${AUTH_SWITCH}", self.env_path.read_text(encoding="utf-8"))
+
+    def test_generic_auth_guard_protects_credential_directory_and_env_source_dependencies(self) -> None:
+        current_parent = self.env_path.parent / "credentials"
+        changed_parent = self.env_path.parent / "other-credentials"
+        for key, lines, submitted in [
+            ("CREDENTIAL_DIR", [f"CREDENTIAL_DIR={current_parent}", "DATABASE_PATH=${CREDENTIAL_DIR}/dummy.db"], str(changed_parent)),
+            ("CONFIG_SOURCE", [f"CONFIG_SOURCE={self.env_path}", "ENV_FILE=${CONFIG_SOURCE}"], str(self.env_path.parent / "other.env")),
+        ]:
+            with self.subTest(key=key), patch.dict(os.environ, clear=False):
+                os.environ.pop("DATABASE_PATH", None)
+                self._rewrite_env("STOCK_LIST=AAPL", "GEMINI_API_KEY=dummy-offline-key", "ADMIN_AUTH_ENABLED=true", *lines)
+                before = self.env_path.read_bytes()
+                with self.assertRaises(ConfigValidationError) as ctx:
+                    self.service.update(
+                        config_version=self.manager.get_config_version(),
+                        items=[{"key": key, "value": submitted}],
+                        reload_now=False,
+                    )
+                self.assertEqual(ctx.exception.issues[0]["code"], "auth_dependency_change_required")
+                self.assertEqual(self.env_path.read_bytes(), before)
 
     def test_get_config_returns_raw_sensitive_values(self) -> None:
         payload = self.service.get_config(include_schema=True)
