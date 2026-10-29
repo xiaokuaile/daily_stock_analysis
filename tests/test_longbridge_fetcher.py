@@ -645,16 +645,24 @@ class TestLongbridgeFetcherMocked(unittest.TestCase):
             mocked_dt.now.assert_called()
 
     def test_volume_ratio_keyword_args_cross_sdk_compat(self):
-        """Verify keyword args work regardless of positional signature drift.
-
-        Simulates a 4.x-style mock where positional order is
-        (symbol, period, adjust_type, forward, count, time) — the opposite
-        of 0.2.74's (symbol, period, adjust_type, forward, time, count).
-        Keyword args in the production code make both signatures callable
-        with the same keyword dict.
-        """
+        """Bind both SDK signatures and verify the resulting volume ratio."""
         import types
-        from datetime import datetime as dt_cls, date as dt_date, timedelta
+        from datetime import datetime as dt_cls, timedelta
+
+        candles = [
+            types.SimpleNamespace(volume=volume, timestamp=dt_cls(2026, 1, 1) + timedelta(days=i))
+            for i, volume in enumerate([40000000, 38000000, 42000000, 41000000, 39000000, 50000000])
+        ]
+
+        def history_legacy(symbol, period, adjust_type, forward, time, count):
+            self.assertEqual(symbol, "AAPL.US")
+            self.assertFalse(forward)
+            self.assertIsInstance(time, dt_cls)
+            self.assertEqual(count, 6)
+            return candles
+
+        def history_current(symbol, period, adjust_type, forward, count, time=None):
+            return history_legacy(symbol, period, adjust_type, forward, time, count)
 
         mock_lb_module = types.ModuleType("longbridge")
         mock_lb_openapi = types.ModuleType("longbridge.openapi")
@@ -668,27 +676,14 @@ class TestLongbridgeFetcherMocked(unittest.TestCase):
             ctx.quote.return_value = [self._make_mock_quote(volume=50000000)]
             ctx.static_info.return_value = [self._make_mock_static()]
 
-            base = dt_date.today() - timedelta(days=6)
-            mock_candles = []
-            for i, vol in enumerate([40000000, 38000000, 42000000, 41000000, 39000000]):
-                c = MagicMock()
-                c.volume = vol
-                past_date = base + timedelta(days=i)
-                c.timestamp = MagicMock()
-                c.timestamp.date.return_value = past_date
-                mock_candles.append(c)
-            ctx.history_candlesticks_by_offset.return_value = mock_candles
-
-            with patch("data_provider.longbridge_fetcher.datetime", wraps=dt_cls):
-                fetcher.get_realtime_quote("AAPL")
-
-            ctx.history_candlesticks_by_offset.assert_called_once()
-            call_kwargs = ctx.history_candlesticks_by_offset.call_args.kwargs
-            self.assertEqual(call_kwargs["count"], 6,
-                "count should be 6 regardless of positional signature version")
-            self.assertIsInstance(call_kwargs["time"], dt_cls,
-                "time should be datetime even when 4.x positional order is (forward, count, time)")
-            self.assertEqual(call_kwargs["symbol"], "AAPL.US")
+            for history in (history_legacy, history_current):
+                with self.subTest(signature=history.__name__):
+                    ctx.history_candlesticks_by_offset.reset_mock()
+                    ctx.history_candlesticks_by_offset.side_effect = history
+                    quote = fetcher.get_realtime_quote("AAPL")
+                    ctx.history_candlesticks_by_offset.assert_called_once()
+                    self.assertIsNotNone(quote)
+                    self.assertEqual(quote.volume_ratio, 1.25)
 
     def test_quote_api_failure_returns_none(self):
         """If ctx.quote() raises, return None gracefully."""

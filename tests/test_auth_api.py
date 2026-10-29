@@ -742,6 +742,49 @@ class AuthDisableViaRealASGITestCase(unittest.TestCase):
         )
         self.assertEqual(login_resp.status_code, 200, login_resp.text)
 
+    def test_generic_config_write_with_valid_session_preserves_auth_boundary(self):
+        """PUT and import must reject bypasses before writing or reloading."""
+        self.env_path.write_text(
+            "CUSTOM_KEY=ok\nSTOCK_LIST=600519\nGEMINI_API_KEY=test\nAUTH_SWITCH=true\n"
+            "ADMIN_AUTH_ENABLED=${AUTH_SWITCH}\nTAIL=ends'\n",
+            encoding="utf-8",
+        )
+        auth.refresh_auth_state()
+        self._login_for_session()
+        before = self.env_path.read_bytes()
+        cases = [
+            ("ADMIN_AUTH_ENABLED", "false", "auth_settings_required"),
+            ("AUTH_SWITCH", "false", "auth_dependency_change_required"),
+            ("ENV_FILE", str(self.data_dir / "other.env"), "config_source_change_required"),
+            ("DATABASE_PATH", str(self.data_dir / "other" / "test.db"), "auth_storage_change_required"),
+            ("CUSTOM_KEY", "safe\u2028ADMIN_AUTH_ENABLED=false", "invalid_value"),
+            ("CUSTOM_KEY", "'", "auth_boundary_changed"),
+        ]
+        for route in ("update", "import"):
+            for key, value, error_code in cases:
+                with self.subTest(route=route, key=key):
+                    current = self.client.get("/api/v1/system/config")
+                    self.assertEqual(current.status_code, 200, current.text)
+                    version = current.json()["config_version"]
+                    if route == "update":
+                        response = self.client.put("/api/v1/system/config", json={
+                            "config_version": version,
+                            "items": [{"key": "STOCK_LIST", "value": "QQQ"}, {"key": key, "value": value}],
+                            "reload_now": True,
+                        })
+                    else:
+                        response = self.client.post("/api/v1/system/config/import", json={
+                            "config_version": version,
+                            "content": f"STOCK_LIST=QQQ\n{key}=" + ('"\'"' if value == "'" else value) + "\n",
+                            "reload_now": True,
+                        })
+                    self.assertEqual(response.status_code, 400, response.text)
+                    self.assertEqual(response.json()["issues"][0]["code"], error_code)
+                    self.assertEqual(self.env_path.read_bytes(), before)
+        auth.refresh_auth_state()
+        self.client.cookies.clear()
+        self.assertEqual(self.client.get("/api/v1/system/config").status_code, 401)
+
     def test_disable_via_real_asgi_with_valid_session_but_no_current_password_returns_400(self):
         """Real middleware + endpoint: valid session cookie + no currentPassword -> 400.
 

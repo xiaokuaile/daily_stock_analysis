@@ -11,7 +11,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Literal, Optional, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Literal, Optional, Set, Tuple
 
 from dotenv import dotenv_values
 
@@ -179,6 +179,7 @@ class ConfigManager:
         updates: Iterable[Tuple[str, str]],
         sensitive_keys: Set[str],
         mask_token: str,
+        validate_content: Optional[Callable[[str], None]] = None,
     ) -> Tuple[List[str], List[str], str]:
         """Apply updates into `.env` file using atomic replace when possible."""
         with self._lock:
@@ -210,11 +211,13 @@ class ConfigManager:
                 mutable_updates[key_upper] = value
 
             if mutable_updates:
-                self._atomic_upsert(mutable_updates)
+                self._atomic_upsert(mutable_updates, validate_content=validate_content)
 
             return list(mutable_updates.keys()), skipped_masked, self.get_config_version()
 
-    def _atomic_upsert(self, updates: Dict[str, str]) -> None:
+    def _atomic_upsert(
+        self, updates: Dict[str, str], validate_content: Optional[Callable[[str], None]] = None,
+    ) -> None:
         """Write updates with atomic rename and in-place fallback for mounted files."""
         entries = self._read_entries()
         key_to_index = self._find_last_key_indexes(entries)
@@ -227,14 +230,15 @@ class ConfigManager:
             else:
                 entries.append(ConfigLineEntry.assignment(key, line_value))
 
-        if not self._env_path.parent.exists():
-            self._env_path.parent.mkdir(parents=True, exist_ok=True)
-
-        temp_path = self._env_path.with_suffix(self._env_path.suffix + ".tmp")
         content = "\n".join(entry.render() for entry in entries)
         if content and not content.endswith("\n"):
             content += "\n"
+        if validate_content is not None:
+            validate_content(content)
 
+        if not self._env_path.parent.exists():
+            self._env_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = self._env_path.with_suffix(self._env_path.suffix + ".tmp")
         with temp_path.open("w", encoding="utf-8", newline="\n") as file_obj:
             file_obj.write(content)
             file_obj.flush()
