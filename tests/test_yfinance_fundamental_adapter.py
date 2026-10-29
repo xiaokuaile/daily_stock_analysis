@@ -342,6 +342,13 @@ class YoyFromRowTest(unittest.TestCase):
         )
         self.assertIsNone(_yoy_from_row(row))
 
+    def test_semiannual_statement_with_fewer_than_five_periods(self) -> None:
+        row = pd.Series(
+            [95.0, 110.0, 100.0],
+            index=pd.to_datetime(["2026-06-30", "2025-12-31", "2025-06-30"]),
+        )
+        self.assertEqual(_yoy_from_row(row), -5.0)
+
     def test_bundle_growth_uses_prior_year_quarter_when_a_quarter_is_missing(self) -> None:
         info = {"financialCurrency": "USD", "currency": "USD", "revenueGrowth": 0.5, "earningsGrowth": 0.5}
         # 2025-09-30 missing; the positional iloc[4] would pick 2025-03-31.

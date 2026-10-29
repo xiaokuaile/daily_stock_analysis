@@ -2068,6 +2068,7 @@ class SystemConfigService:
         if current_version != config_version:
             raise ConfigConflictError(current_version=current_version)
 
+        items = self._guard_generic_auth_updates(items)
         issues = self._collect_issues(items=items, mask_token=mask_token)
         errors = [issue for issue in issues if issue["severity"] == "error"]
         if errors:
@@ -2091,6 +2092,7 @@ class SystemConfigService:
             updates=updates,
             sensitive_keys=sensitive_keys,
             mask_token=mask_token,
+            validate_content=self._validate_rendered_auth_boundary,
         )
 
         warnings: List[str] = []
@@ -2148,6 +2150,190 @@ class SystemConfigService:
             "updated_keys": updated_keys,
             "warnings": warnings,
         }
+
+    def _guard_generic_auth_updates(self, items: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
+        """Keep authentication changes on the password-confirmed auth endpoint.
+
+        Both config update and env import share this write boundary. Equivalent
+        auth values in backups are ignored so the saved representation survives.
+        Environment identifiers are validated before serialization to prevent
+        alternate dotenv syntax or key newlines from bypassing the guard.
+        Internal apply_simple_updates remains available to the auth endpoint.
+        """
+        saved_map = self._manager.read_config_map()
+        saved_enabled = str(saved_map.get("ADMIN_AUTH_ENABLED") or "").strip().lower() in {
+            "true", "1", "yes",
+        }
+        active_env_path = Path(os.environ.get("ENV_FILE") or self._manager.env_path).resolve()
+        active_database_path = os.environ.get(
+            "DATABASE_PATH", saved_map.get("DATABASE_PATH", "./data/stock_analysis.db"),
+        )
+        active_credential_parent = Path(active_database_path).resolve().parent
+        from dotenv import dotenv_values
+
+        raw_map = dotenv_values(self._manager.env_path, interpolate=False)
+        protected_targets = {"ADMIN_AUTH_ENABLED", "ENV_FILE"}
+        if saved_enabled:
+            protected_targets.add("DATABASE_PATH")
+        protected_dependencies = self._auth_config_dependencies(raw_map, protected_targets)
+        normalized_items: List[Dict[str, str]] = []
+        issues: List[Dict[str, Any]] = []
+        for item in items:
+            key = item["key"].strip().upper()
+            value = item["value"]
+            if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", key):
+                issues.append({
+                    "key": "config_key",
+                    "code": "invalid_key",
+                    "message": "Configuration keys must be environment variable identifiers",
+                    "severity": "error",
+                    "expected": "[A-Za-z_][A-Za-z0-9_]*",
+                    "actual": "invalid identifier",
+                })
+                continue
+            dependencies = {name for name in protected_dependencies if name.upper() == key}
+            if dependencies and key not in protected_targets:
+                unchanged_values = {
+                    candidate
+                    for name in dependencies
+                    for candidate in (raw_map.get(name), saved_map.get(name, os.environ.get(name)))
+                }
+                if value not in unchanged_values:
+                    issues.append({
+                        "key": key,
+                        "code": "auth_dependency_change_required",
+                        "message": "Change authentication configuration dependencies through offline migration",
+                        "severity": "error",
+                        "expected": "unchanged authentication configuration dependency",
+                        "actual": "authentication configuration dependency change",
+                    })
+                continue
+            # A literal backup may contain the original ${VAR} expression.
+            # Compare its resolved value but keep the saved representation intact.
+            unchanged_raw = key in raw_map and value == raw_map[key]
+            boundary_value = saved_map.get(key, value) if unchanged_raw else value
+            if key == "ENV_FILE":
+                try:
+                    submitted_env_path = Path(boundary_value.strip() or self._manager.env_path).resolve()
+                    same_source = submitted_env_path == active_env_path
+                except (OSError, ValueError, RuntimeError):
+                    same_source = False
+                if not same_source:
+                    issues.append({
+                        "key": key,
+                        "code": "config_source_change_required",
+                        "message": "Move the active environment file through offline configuration migration",
+                        "severity": "error",
+                        "expected": "unchanged active configuration source",
+                        "actual": "configuration source change",
+                    })
+                continue
+            if key == "DATABASE_PATH" and saved_enabled:
+                try:
+                    # New interpolation would be evaluated after saving and can
+                    # escape a directory that only appears equivalent lexically.
+                    same_credential_parent = (
+                        "${" not in boundary_value
+                        and Path(boundary_value).resolve().parent == active_credential_parent
+                    )
+                except (OSError, ValueError, RuntimeError):
+                    same_credential_parent = False
+                if not same_credential_parent:
+                    issues.append({
+                        "key": key,
+                        "code": "auth_storage_change_required",
+                        "message": "Move administrator credentials through offline configuration migration",
+                        "severity": "error",
+                        "expected": "unchanged administrator credential directory",
+                        "actual": "administrator credential directory change",
+                    })
+                    continue
+                if unchanged_raw:
+                    continue
+            if key == "ADMIN_AUTH_ENABLED":
+                token = boundary_value.strip().lower()
+                if token not in {"true", "1", "yes", "false", "0", "no", ""}:
+                    issues.append({
+                        "key": key,
+                        "code": "invalid_type",
+                        "message": "ADMIN_AUTH_ENABLED must contain a boolean value",
+                        "severity": "error",
+                        "expected": "true|false",
+                        "actual": "invalid boolean",
+                    })
+                elif (token in {"true", "1", "yes"}) != saved_enabled:
+                    issues.append({
+                        "key": key,
+                        "code": "auth_settings_required",
+                        "message": "Change administrator authentication through /api/v1/auth/settings",
+                        "severity": "error",
+                        "expected": "unchanged authentication state",
+                        "actual": "authentication state change",
+                    })
+                continue
+            normalized_items.append({"key": key, "value": value})
+        if issues:
+            raise ConfigValidationError(issues=issues)
+        return normalized_items
+
+    @staticmethod
+    def _auth_config_dependencies(raw_map: Dict[str, Any], targets: Set[str]) -> Set[str]:
+        """Follow dotenv references using their original case-sensitive names."""
+        dependencies: Set[str] = set()
+        pending = list(targets)
+        visited: Set[str] = set()
+        while pending:
+            target = pending.pop()
+            if target in visited:
+                continue
+            visited.add(target)
+            references = re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?=[:}])", str(raw_map.get(target) or ""))
+            for dependency in references:
+                dependencies.add(dependency)
+                pending.append(dependency)
+        return dependencies
+
+    def _validate_rendered_auth_boundary(self, content: str) -> None:
+        """Check the actual serialized dotenv before any file is written.
+
+        A quote in another field can consume later assignments even without a
+        newline in the submitted value. Preserve protected declarations and
+        their dependencies, then verify effective paths after interpolation.
+        ConfigManager invokes this while holding its write lock.
+        """
+        from dotenv import dotenv_values
+
+        saved_raw = dotenv_values(self._manager.env_path, interpolate=False)
+        rendered_raw = dotenv_values(stream=io.StringIO(content), interpolate=False)
+        saved_map = self._manager.read_config_map()
+        targets = {"ADMIN_AUTH_ENABLED", "ENV_FILE"}
+        if str(saved_map.get("ADMIN_AUTH_ENABLED") or "").strip().lower() in {"true", "1", "yes"}:
+            targets.add("DATABASE_PATH")
+        immutable_keys = {"ADMIN_AUTH_ENABLED", "ENV_FILE"} | self._auth_config_dependencies(saved_raw, targets)
+        lost_database_path = (
+            "DATABASE_PATH" in targets and "DATABASE_PATH" in saved_raw and "DATABASE_PATH" not in rendered_raw
+        )
+        if lost_database_path or any(saved_raw.get(key) != rendered_raw.get(key) for key in immutable_keys):
+            raise ConfigValidationError(issues=[{
+                "key": "config_content",
+                "code": "auth_boundary_changed",
+                "message": "Serialized configuration would alter authentication settings or dependencies",
+                "severity": "error",
+                "expected": "unchanged authentication boundary",
+                "actual": "authentication boundary change",
+            }])
+        rendered = dotenv_values(stream=io.StringIO(content))
+        self._guard_generic_auth_updates([
+            {"key": "ADMIN_AUTH_ENABLED", "value": rendered.get("ADMIN_AUTH_ENABLED") or ""},
+            {
+                "key": "ENV_FILE",
+                "value": rendered.get("ENV_FILE") or str(os.environ.get("ENV_FILE") or self._manager.env_path),
+            },
+            {
+                "key": "DATABASE_PATH",
+                "value": rendered.get("DATABASE_PATH", os.environ.get("DATABASE_PATH", "./data/stock_analysis.db")) or "",
+            },
+        ])
 
     def _build_explainability_warnings(
         self,
@@ -2564,11 +2750,10 @@ class SystemConfigService:
         validation = field_schema.get("validation", {}) or {}
         is_required = field_schema.get("is_required", False)
 
-        # Empty values are valid for non-required fields (skip type validation)
-        if not value.strip() and not is_required:
-            return issues
-
-        if ("\n" in value or "\r" in value) and data_type != "json":
+        # ConfigManager reads physical entries with str.splitlines(). Reject
+        # every separator it recognizes before an ordinary value reaches disk.
+        line_separators = "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+        if any(separator in value for separator in line_separators) and data_type != "json":
             issues.append(
                 {
                     "key": key,
@@ -2579,6 +2764,10 @@ class SystemConfigService:
                     "actual": "contains newline",
                 }
             )
+            return issues
+
+        # Empty values are valid for non-required fields (skip type validation).
+        if not value.strip() and not is_required:
             return issues
 
         if data_type == "integer":
@@ -2801,14 +2990,19 @@ class SystemConfigService:
             return value
 
         if not value.strip():
-            return value
+            return ""
 
         try:
             parsed = json.loads(value)
         except json.JSONDecodeError:
             return value
 
-        return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+        normalized = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+        # JSON permits these Unicode characters inside strings, but raw .env
+        # readers split them as physical lines on the next update.
+        for separator in ("\x85", "\u2028", "\u2029"):
+            normalized = normalized.replace(separator, f"\\u{ord(separator):04x}")
+        return normalized
 
     @staticmethod
     def _validate_numeric_range(key: str, numeric_value: float, validation: Dict[str, Any]) -> List[Dict[str, Any]]:
